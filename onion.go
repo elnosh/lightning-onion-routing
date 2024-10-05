@@ -1,8 +1,11 @@
 package lightning_onion
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"golang.org/x/crypto/chacha20"
@@ -17,7 +20,6 @@ func (h HopPayload) Size() int {
 type HopPayload struct {
 	PublicKey *secp256k1.PublicKey
 	Payload   []byte
-	Hmac      []byte
 }
 
 type Onion struct {
@@ -42,9 +44,12 @@ func ConstructOnion(sessionKey *secp256k1.PrivateKey, hops []HopPayload) (*Onion
 
 		// shared secret is computed by doing ECDH exchange with the current ephemeral private key
 		// and the hop's public key and then hashing (SHA256) that
+		// NOTE: node peeling the onion at this hop will derive the shared secret
+		// by doing the reverse i.e ECDH using his own private key and the ephemeral public key
 		var pkpoint, ecdhpoint secp256k1.JacobianPoint
 		hop.PublicKey.AsJacobian(&pkpoint)
 		secp256k1.ScalarMultNonConst(&currentkey.Key, &pkpoint, &ecdhpoint)
+		ecdhpoint.ToAffine()
 		ecdhkey := secp256k1.NewPublicKey(&ecdhpoint.X, &ecdhpoint.Y)
 		sharedSecret := sha256.Sum256(ecdhkey.SerializeCompressed())
 
@@ -113,6 +118,92 @@ func ConstructOnion(sessionKey *secp256k1.PrivateKey, hops []HopPayload) (*Onion
 		HopPayloads: hopPayloads,
 		Hmac:        hmac,
 	}, nil
+}
+
+func ProcessOnion(onion *Onion, hopPrivateKey *secp256k1.PrivateKey) (*Onion, error) {
+	if onion.Version != 0x00 {
+		return nil, errors.New("incorrect version")
+	}
+
+	// ephemeral public key that will be used for deriving the shared secret
+	pubkey, err := secp256k1.ParsePubKey(onion.Point[:])
+	if err != nil {
+		return nil, fmt.Errorf("invalid public key: %v", err)
+	}
+
+	// shared secret is computed by doing ECDH exchange with the ephemeral public key
+	// and the hop's private key and then hashing (SHA256) that
+	// NOTE: the origin node did the reverse i.e it calculated the shared
+	// secret by doing ECDH using the ephemeral private key and this hop's public key
+	var pubkeypoint, ecdhpoint secp256k1.JacobianPoint
+	pubkey.AsJacobian(&pubkeypoint)
+	secp256k1.ScalarMultNonConst(&hopPrivateKey.Key, &pubkeypoint, &ecdhpoint)
+	ecdhpoint.ToAffine()
+	ecdhkey := secp256k1.NewPublicKey(&ecdhpoint.X, &ecdhpoint.Y)
+	sharedSecret := sha256.Sum256(ecdhkey.SerializeCompressed())
+
+	// derive hmac and compare with hmac in onion
+	muKey := generateKey(mu, sharedSecret[:])
+	h := hmac.New(sha256.New, muKey)
+	h.Write(onion.HopPayloads[:])
+	hmacBytes := h.Sum(nil)
+	if !hmac.Equal(hmacBytes, onion.Hmac[:]) {
+		return nil, errors.New("invalid hmac")
+	}
+
+	// derive bytestream which will then be xor'd with the payload
+	// that will decrypt only the intended payload for this hop.
+	rhoKey := generateKey(rho, sharedSecret[:])
+	byteStream := generateRandomByteStream(rhoKey, 2600)
+	var unwrappedPayloads [2600]byte
+	xor(unwrappedPayloads[:], onion.HopPayloads[:], byteStream)
+
+	// this length should be encoded
+	payloadLength := unwrappedPayloads[0]
+	if payloadLength < 2 {
+		return nil, errors.New("payload length too short")
+	}
+
+	payload := make([]byte, payloadLength)
+	copy(payload, unwrappedPayloads[1:payloadLength+1])
+	fmt.Printf("payload intended for hop: %v\n", payload)
+
+	nextHmac := unwrappedPayloads[1+payloadLength : 1+payloadLength+32]
+	zeroslice := make([]byte, 32)
+	// if nextHmac is all-zero, then this is the final destination, congrats
+	if bytes.Compare(zeroslice, nextHmac) == 0 {
+		return onion, nil
+	}
+
+	// derive blinding factor which is the SHA256 of the ephemeral public key and the shared secret
+	blindingFactor := sha256.Sum256(append(pubkey.SerializeCompressed(), sharedSecret[:]...))
+	blindingFactorKey := secp256k1.PrivKeyFromBytes(blindingFactor[:])
+
+	// public key for the next hop is the current ephemeral public key
+	// multiplied by the blinding factor
+	var publickeyPoint, nextPublicKeyPoint secp256k1.JacobianPoint
+	pubkey.AsJacobian(&publickeyPoint)
+	secp256k1.ScalarMultNonConst(&blindingFactorKey.Key, &publickeyPoint, &nextPublicKeyPoint)
+	nextPublicKeyPoint.ToAffine()
+
+	nextPublicKey := secp256k1.NewPublicKey(&nextPublicKeyPoint.X, &nextPublicKeyPoint.Y)
+	var publicKey [33]byte
+	copy(publicKey[:], nextPublicKey.SerializeCompressed())
+
+	var nextHopPayloads [1300]byte
+	copy(nextHopPayloads[:], unwrappedPayloads[1+payloadLength+32:])
+
+	var hmac [32]byte
+	copy(hmac[:], nextHmac)
+
+	// onion to send to next hop in route
+	nextHopOnion := &Onion{
+		Version:     0x00,
+		Point:       publicKey,
+		HopPayloads: nextHopPayloads,
+		Hmac:        hmac,
+	}
+	return nextHopOnion, nil
 }
 
 // each hop needs to decrypt the routing information intended for it
